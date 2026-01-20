@@ -203,3 +203,36 @@ def ordinal_accuracy(y_test, y_predicted):
         value_cumulation = value_cumulation + value
     return value_cumulation/float(len(y_test))
 
+
+import time, logging
+
+class PhaseTimer:
+    """
+    Context manager para loguear el tiempo de una fase.
+    Uso:
+        with PhaseTimer("Tokenización"):
+            ... código ...
+    """
+    def __init__(self, label: str, logger = None):
+        self.label = label
+        self.log = logger or logging.getLogger(__name__)
+        if not self.log.handlers:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s | %(levelname)-7s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
+
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        self.log.info(f"[{self.label}] inicio")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        dt = time.perf_counter() - self.t0
+        if exc:
+            self.log.error(f"[{self.label}] ERROR tras {dt:.2f}s: {exc}")
+        else:
+            self.log.info(f"[{self.label}] fin en {dt:.2f}s")
+        # devolver False para propagar excepción si la hubiera
+        return False

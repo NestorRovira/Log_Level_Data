@@ -1,397 +1,392 @@
 # -*- coding: utf-8 -*-
-import yaml
+# ================================================================
+# block_level_LSTM.py  (versión TF1.15 + Keras 2.3.1 + gensim 3.8.3)
+# ------------------------------------------------
+# - Soporta dos cabezas: --model {ordinal|onehot}
+# - Busca logged_syn_<dataset>.csv en rutas conocidas
+# - Logs detallados por fase + medición de tiempo
+# ================================================================
+
 import os
 import sys
-import re as re
+import re
+import ast
 import time
 import logging
-
-import multiprocessing
-import numpy as np
-from gensim.models.word2vec import Word2Vec
-from gensim.corpora.dictionary import Dictionary
-
 import random as rn
-seed_value = 17020
-seed_window = 1500
+import argparse
+from typing import List, Tuple, Optional
 
+import numpy as np
 import pandas as pd
-import csv
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from sklearn.preprocessing import LabelEncoder
 
-import matplotlib.pyplot as plt
-
+# ===== TensorFlow 1.x backend para Keras =====
 import tensorflow as tf
+try:
+    # Asegura modo gráfico clásico (por si el entorno hubiera tocado eager)
+    tf.compat.v1.disable_eager_execution()
+except Exception:
+    pass
+
 from keras import backend as K
-from keras.models import Sequential
-from keras.layers import Dense, Dropout, Embedding, LSTM, Bidirectional
+from keras.layers import Input, Embedding, Bidirectional, LSTM, Dropout
+from keras.models import Model
+from keras.optimizers import Adam
 
-from src import Helper
+# gensim 3.8.3
+from gensim.models import Word2Vec
 
-# -----------------------------
-# Logging setup (ordenado)
-# -----------------------------
+# sklearn
+from sklearn.model_selection import train_test_split
+
+# ---------------------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
-    datefmt="%H:%M:%S"
+    datefmt="%H:%M:%S",
 )
-log = logging.getLogger("DeepLV")
+log = logging.getLogger("block_LSTM")
 
-# -----------------------------
-# TensorFlow (compat 1.x)
-# -----------------------------
-config = tf.ConfigProto(device_count={'GPU': 1, 'CPU': 16})
-sess = tf.Session(config=config)
-K.set_session(sess)
+# ---------------------------------------------------------------------
+# PhaseTimer: intenta traer de Helper, si no existe usa fallback
+# ---------------------------------------------------------------------
+try:
+    from Helper import PhaseTimer as _PhaseTimer  # type: ignore
+except Exception:
+    class _PhaseTimer:
+        def __init__(self, label: str):
+            self.label = label
+        def __enter__(self):
+            self.t0 = time.perf_counter()
+            log.info(f"[{self.label}] inicio")
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            dt = time.perf_counter() - self.t0
+            if exc:
+                log.error(f"[{self.label}] ERROR tras {dt:.2f}s: {exc}")
+            else:
+                log.info(f"[{self.label}] fin en {dt:.2f}s")
+            return False
+PhaseTimer = _PhaseTimer
 
-# -----------------------------
-# Config global (sin cambios)
-# -----------------------------
-csv.field_size_limit(100000000)
-sys.setrecursionlimit(1000000)
+# ---------------------------------------------------------------------
+# Hiperparámetros y cabezas
+# ---------------------------------------------------------------------
+from hparams import HP
+from model_heads import add_head_ordinal, add_head_onehot
 
-n_iterations = 1
-embedding_iterations = 1
-n_epoch = 50
+# ---------------------------------------------------------------------
+# Semillas / determinismo (TF1 + Keras 2.3.1)
+# ---------------------------------------------------------------------
+def set_seeds(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    rn.seed(seed)
+    np.random.seed(seed)
+    try:
+        tf.set_random_seed(seed)  # TF1.x
+    except Exception:
+        try:
+            tf.random.set_seed(seed)  # fallback por si el wrapper expone TF2 API
+        except Exception:
+            log.warning("No pude fijar semilla de TensorFlow.")
 
-vocab_dim = 100
-maxlen = 100
-n_exposures = 10
-window_size = 7
-batch_size = 24
-input_length = 100
-cpu_count = multiprocessing.cpu_count()
+    import multiprocessing
+    n = multiprocessing.cpu_count()
+    cfg = tf.ConfigProto(intra_op_parallelism_threads=n,
+                         inter_op_parallelism_threads=n)
+    sess = tf.Session(config=cfg)
+    K.set_session(sess)
 
-test_list = []
-neg_full = []
-pos_full = []
-syntactic_list = []
+# ---------------------------------------------------------------------
+# Utilidades de etiquetas (ordinal vs onehot)
+# ---------------------------------------------------------------------
+LEVEL_ORDER = ["trace", "debug", "info", "warn", "error"]
 
-# Paths de salida (igual que antes)
-model_location = 'model_block' + '/lstm_' + sys.argv[1]
-embedding_location = 'embedding_block' + '/Word2vec_model_' + sys.argv[1] + '.pkl'
+def norm_level(x: str) -> str:
+    x = (x or "").strip().lower()
+    if x == "warning":
+        return "warn"
+    if x not in LEVEL_ORDER:
+        return "info"
+    return x
 
+def level_to_index(x: str) -> int:
+    return LEVEL_ORDER.index(norm_level(x))
 
-# -----------------------------
-# Utilidades de logging
-# -----------------------------
-class PhaseTimer:
-    def __init__(self, name):
-        self.name = name
-        self.t0 = None
-    def __enter__(self):
-        self.t0 = time.time()
-        log.info(f"[{self.name}] Inicio")
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        dt = time.time() - self.t0
-        if exc_type is None:
-            log.info(f"[{self.name}] Fin en {dt:.2f}s")
+def labels_to_ordinal(idx: np.ndarray) -> np.ndarray:
+    idx = np.asarray(idx).astype(int)
+    y = np.zeros((len(idx), 5), dtype="float32")
+    for i, k in enumerate(idx):
+        y[i, :k+1] = 1.0
+    return y
+
+def labels_to_onehot(idx: np.ndarray) -> np.ndarray:
+    idx = np.asarray(idx).astype(int)
+    y = np.zeros((len(idx), 5), dtype="float32")
+    y[np.arange(len(idx)), idx] = 1.0
+    return y
+
+def ordinal_to_index(y_ord: np.ndarray) -> np.ndarray:
+    return np.sum((y_ord >= 0.5).astype(int), axis=1) - 1
+
+def ensure_label_format(y, model_kind: str) -> np.ndarray:
+    y = np.asarray(y)
+    if y.ndim == 1:
+        return labels_to_ordinal(y) if model_kind == "ordinal" else labels_to_onehot(y)
+    if y.ndim == 2 and y.shape[1] == 5:
+        if model_kind == "ordinal":
+            return y
         else:
-            log.error(f"[{self.name}] Error tras {dt:.2f}s")
+            idx = ordinal_to_index(y)
+            return labels_to_onehot(idx)
+    raise ValueError("Formato de etiquetas no reconocido.")
 
-def _brief_seq(seq, n=3):
-    return seq[:n] + ['...'] + seq[-n:] if len(seq) > 2*n else seq
+# ---------------------------------------------------------------------
+# Carga de datos desde el CSV de block_processing
+# ---------------------------------------------------------------------
+CANDIDATE_PATHS = [
+    os.path.join("block_processing", "blocks", "logged_syn_{ds}.csv"),
+    os.path.join("blocks", "logged_syn_{ds}.csv"),
+]
 
-# -----------------------------
-# Carga de datos (igual lógica)
-# -----------------------------
-def loadfile():
+CANDIDATE_TEXT_COLS = ["Values", "values", "Tokens", "tokens", "Content", "content", "Text", "text"]
+CANDIDATE_LABEL_COLS = ["Level", "level", "LogLevel", "log_level", "Label", "label", "lvl"]
+
+def _find_csv(dataset: Optional[str]) -> str:
+    ds = dataset or "cassandra"
+    for tmpl in CANDIDATE_PATHS:
+        p = tmpl.format(ds=ds)
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(
+        f"No encuentro el CSV de bloques con log para dataset='{ds}'. "
+        f"Probadas rutas: {[t.format(ds=ds) for t in CANDIDATE_PATHS]}"
+    )
+
+def _pick_column(df: pd.DataFrame, candidates: List[str]) -> str:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise KeyError(
+        f"No se encontró ninguna de las columnas esperadas. Vistas={list(df.columns)}; "
+        f"Buscadas={candidates}"
+    )
+
+def _parse_tokens(cell) -> List[str]:
+    if isinstance(cell, list):
+        return [str(t) for t in cell]
+    if isinstance(cell, str):
+        s = cell.strip()
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+            try:
+                li = ast.literal_eval(s)
+                return [str(t) for t in li]
+            except Exception:
+                pass
+        return [tok for tok in re.split(r"[^A-Za-z0-9_]+", s) if tok]
+    return [str(cell)]
+
+def loadfile(dataset: Optional[str]):
+    with PhaseTimer("Carga CSV"):
+        path = _find_csv(dataset)
+        df = pd.read_csv(path, encoding="utf-8")
+        log.info(f"CSV: {path} | filas={len(df):,} | columnas={list(df.columns)}")
+
+    text_col = _pick_column(df, CANDIDATE_TEXT_COLS)
+    label_col = _pick_column(df, CANDIDATE_LABEL_COLS)
+
+    with PhaseTimer("Parseo tokens + labels"):
+        tokens_all = [_parse_tokens(v) for v in df[text_col].tolist()]
+        labels_idx = np.array([level_to_index(str(v)) for v in df[label_col].tolist()], dtype=np.int32)
+
+    with PhaseTimer("Split 60/20/20 estratificado"):
+        X_train, X_tmp, y_train, y_tmp = train_test_split(
+            tokens_all, labels_idx, test_size=HP.val_split + HP.test_split,
+            stratify=labels_idx, random_state=17020
+        )
+        rel_test = HP.test_split / (HP.val_split + HP.test_split)
+        X_val, X_test, y_val, y_test = train_test_split(
+            X_tmp, y_tmp, test_size=rel_test,
+            stratify=y_tmp, random_state=17021
+        )
+        log.info(f"Split -> train={len(X_train)} val={len(X_val)} test={len(X_test)}")
+
+    combined = X_train + X_val + X_test
+    y_all = labels_idx
+    return combined, y_all, X_train, X_val, X_test, y_train, y_val, y_test
+
+# ---------------------------------------------------------------------
+# Tokenizer “identidad” (ya venimos tokenizados)
+# ---------------------------------------------------------------------
+def tokenizer(token_lists: List[List[str]]) -> List[List[str]]:
+    return token_lists
+
+# ---------------------------------------------------------------------
+# Word2Vec + diccionario + transformaciones (gensim 3.8.3 compatible)
+# ---------------------------------------------------------------------
+def word2vec_train(tokenized_sentences: List[List[str]],
+                   vector_size: int = None, window: int = 5, min_count: int = 1):
     """
-    Carga el CSV generado por block_processing para el dataset indicado
-    (por ejemplo: cassandra, flink, kafka...).
+    Compatibilidad gensim 3.x y 4.x:
+      - 4.x: Word2Vec(..., vector_size=dim)
+      - 3.x: Word2Vec(..., size=dim)
+      - vocab: 4.x -> wv.index_to_key ; 3.x -> wv.index2word
     """
-    # Dataset viene como argumento del script
-    dataset = sys.argv[1].strip()  # "cassandra", "flink", etc.
+    dim = vector_size or HP.embedding_dim
+    try:
+        # gensim 4.x
+        model = Word2Vec(sentences=tokenized_sentences, vector_size=dim,
+                         window=window, min_count=min_count, workers=4)
+        vocab_list = model.wv.index_to_key
+    except TypeError:
+        # gensim 3.x
+        model = Word2Vec(sentences=tokenized_sentences, size=dim,
+                         window=window, min_count=min_count, workers=4)
+        vocab_list = model.wv.index2word
 
-    # Ruta dinámica al CSV correspondiente
-    csv_path_literal = f"block_processing/blocks/logged_syn_{dataset}.csv"
+    index_dict = {w: i + 1 for i, w in enumerate(vocab_list)}
+    log.info(f"Word2Vec entrenado. vocab={len(index_dict)} dim={dim}")
+    return index_dict, model.wv, tokenized_sentences
 
-    log.info(f"[Datos] cwd={os.getcwd()}")
-    log.info(f"[Datos] CSV esperado: {csv_path_literal}")
+def input_transform(tokenized_sentences: List[List[str]], index_dict: dict,
+                    pad_to: Optional[int] = None) -> np.ndarray:
+    seqs = [[index_dict.get(tok, 0) for tok in sent] for sent in tokenized_sentences]
+    maxlen = pad_to or (max((len(s) for s in seqs), default=1))
+    X = np.zeros((len(seqs), maxlen), dtype=np.int32)
+    for i, s in enumerate(seqs):
+        L = min(len(s), maxlen)
+        X[i, :L] = s[:L]
+    return X
 
-    # Comprobar existencia antes de leer (log más claro si falta)
-    if not os.path.exists(csv_path_literal):
-        log.error(f"[Datos] No se encontró el fichero: {csv_path_literal}")
-        raise FileNotFoundError(f"No existe el dataset '{dataset}' o falta su CSV")
-
-    with PhaseTimer(f"Lectura CSV ({dataset})"):
-        data_full = pd.read_csv(
-            csv_path_literal,
-            usecols=['Key', 'Values', 'Level', 'Message'],  # por nombre
-            engine='python'
-        )
-
-    dataset_values = data_full.values
-    classes = dataset_values[:, 2]
-    data = data_full['Values'].values.tolist()
-    combined = data
-    combined_full = data_full.values.tolist()
-
-    log.info(f"[Datos] Filas={len(data_full):,} | Columnas={list(data_full.columns)}")
-    log.info(f"[Datos] Ejemplo 'Values': {combined[0] if combined else '(vacío)'}")
-
-    # Codificación y splits igual que antes
-    with PhaseTimer("Encode etiquetas"):
-        encoder = LabelEncoder()
-        encoder.fit(classes)
-        encoded_Y = encoder.transform(classes)
-        y = Helper.ordinal_encoder(classes)
-
-    with PhaseTimer("Split train/val/test"):
-        x_train, x_test, y_train, y_test = train_test_split(
-            combined_full, y, test_size=0.2, train_size=0.8,
-            random_state=seed_value, stratify=y
-        )
-        x_train, x_val, y_train, y_val = train_test_split(
-            x_train, y_train, test_size=0.25, train_size=0.75,
-            random_state=seed_value, stratify=y_train
-        )
-
-    test_block_list, train_block_list = [], []
-    for x in x_test:
-        test_list.append(x[0])
-        test_block_list.append(x[1])
-    x_test = np.array(test_block_list)
-    for x in x_train:
-        train_block_list.append(x[1])
-    x_train = train_block_list
-
-    log.info(f"[Datos] Split → train={len(x_train):,} | val={len(x_val):,} | test={len(x_test):,}")
-
-    return combined, y, x_train, x_val, x_test, y_train, y_val, y_test
-
-
-
-# -----------------------------
-# Tokenización (igual lógica)
-# -----------------------------
-def word_splitter(word, docText):
-    splitted = re.sub('([A-Z][a-z]+)', r' \1', re.sub('([A-Z]+)', r' \1', word)).split()
-    for word in splitted:
-        docText.append(word.lower())
-
-def tokenizer(text):
-    newText = []
-    for doc in text:
-        docText = []
-        for word in str(doc).replace("'", "").replace("[", "").replace("]", "").replace(",", "").replace('"', "").split(' '):
-            docText.append(word)
-        newText.append(docText)
-    return newText
-
-
-# -----------------------------
-# Embedding / Diccionarios
-# -----------------------------
-def input_transform(words):
-    model = Word2Vec.load(embedding_location)
-    _, _, dictionaries = create_dictionaries(model, words)
-    return dictionaries
-
-def create_dictionaries(model=None, combined=None):
-    from keras.preprocessing import sequence
-    if (combined is not None) and (model is not None):
-        gensim_dict = Dictionary()
-        gensim_dict.doc2bow(model.wv.vocab.keys(), allow_update=True)
-        w2indx = {v: k + 1 for k, v in gensim_dict.items()}
-        w2vec = {word: model.wv[word] for word in w2indx.keys()}
-
-        def parse_dataset(combined):
-            data = []
-            for sentence in combined:
-                new_txt = []
-                for word in sentence:
-                    try:
-                        new_txt.append(w2indx[word])
-                    except:
-                        new_txt.append(0)
-                data.append(new_txt)
-            return data
-
-        combined = parse_dataset(combined)
-        combined = sequence.pad_sequences(combined, maxlen=maxlen)
-        return w2indx, w2vec, combined
-
-def word2vec_train(combined):
-    with PhaseTimer("Entrenar Word2Vec"):
-        model = Word2Vec(size=vocab_dim,
-                         min_count=n_exposures,
-                         window=window_size,
-                         workers=cpu_count, sg=1,
-                         iter=embedding_iterations)
-        model.build_vocab(combined)
-        model.save(embedding_location)
-        index_dict, word_vectors, combined = create_dictionaries(model=model, combined=combined)
-    log.info(f"[W2V] Guardado en: {embedding_location}")
-    log.info(f"[W2V] Vocab={len(index_dict):,} | dim={vocab_dim}")
-    return index_dict, word_vectors, combined
-
-def get_data(index_dict, word_vectors, combined):
+def get_data(index_dict: dict, word_vectors, _combined) -> Tuple[int, np.ndarray]:
+    """
+    Construye matriz de embeddings compatible con gensim 3.x y 4.x.
+    """
     n_symbols = len(index_dict) + 1
-    embedding_weights = np.zeros((n_symbols, vocab_dim))
-    for word, index in index_dict.items():
-        embedding_weights[index, :] = word_vectors[word]
-    log.info(f"[Embedding] n_symbols={n_symbols:,} | weights={embedding_weights.shape}")
-    return n_symbols, embedding_weights
-
-
-# -----------------------------
-# Modelo LSTM (igual lógica)
-# -----------------------------
-def train_lstm(n_symbols, embedding_weights, x_train, y_train, x_test, y_test, x_val, y_val):
-    tf.set_random_seed(seed_value)
-
-    model = Sequential()
-    model.add(Embedding(output_dim=vocab_dim,
-                        input_dim=n_symbols,
-                        mask_zero=True,
-                        weights=[embedding_weights],
-                        input_length=input_length))
-    model.add(Bidirectional(LSTM(output_dim=128, activation='sigmoid')))
-    model.add(Dropout(0.2))
-    model.add(Dense(5, activation='sigmoid'))
-
-    log.info("Compilando modelo…")
-    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
-
-    log.info(f"Train: x={np.shape(x_train)} y={np.shape(y_train)} | "
-             f"Val: x={np.shape(x_val)} y={np.shape(y_val)} | "
-             f"Test: x={np.shape(x_test)} y={np.shape(y_test)}")
-
-    log.info("Entrenando…")
-    history = model.fit(x_train, y_train,
-                        batch_size=batch_size,
-                        epochs=n_epoch,
-                        verbose=1,
-                        validation_data=(x_val, y_val))
-
-    base_min = optimal_epoch(history)
-    log.info("Evaluando en test…")
-    score = model.evaluate(x_test, y_test, batch_size=batch_size)
-
-    # Guardado (mismo comportamiento/paths)
-    yaml_string = model.to_yaml()
-    with open(model_location + '.yml', 'w') as outfile:
-        outfile.write(yaml.dump(yaml_string, default_flow_style=True))
-    model.save_weights(model_location + '.h5')
-    np.set_printoptions(threshold=sys.maxsize)
-    log.info(f"[Modelo] Guardado YAML en: {model_location + '.yml'}")
-    log.info(f"[Modelo] Guardado PESOS en: {model_location + sys.argv[1] + '.h5'}")
-
-    prob_predicted = model.predict(x_test, verbose=1)
-    label_predicted = Helper.predict_prob_encoder(prob_predicted)
-    num_y_test = Helper.pd_encoder(y_test)
-    num_y_predicted = Helper.pd_encoder(label_predicted)
-
-    val_accuracy = accuracy_score(y_test, label_predicted)
-    log.info(f"Accuracy final (test): {val_accuracy:.4f}")
-    Helper.class_accuracy(y_test, label_predicted)
-
-    with open(model_location + '_target.txt', 'wt') as f:
-        for y in y_test:
-            f.write(str(y) + '\n')
-    with open(model_location + '_predicted.txt', 'wt') as f:
-        for y in label_predicted:
-            f.write(str(y) + '\n')
-    log.info(f"[Salida] Targets: {model_location + '_target.txt'}")
-    log.info(f"[Salida] Predichos: {model_location + '_predicted.txt'}")
-
-    return [val_accuracy]
-
-
-def get_FP_FN(label_predicted, label_target):
-    FP_id_list = []
-    FN_id_list = []
-    for i in range(0, len(label_predicted)):
-        if int(label_predicted[i]) == 1 and int(label_target[i]) == 0:
-            FP_id_list.append(i)
-        elif int(label_predicted[i]) == 0 and int(label_target[i]) == 1:
-            FN_id_list.append(i)
-
-    with open('model_block' + '/labels/list/lstm_FP_' + sys.argv[1] + '.txt', 'wt') as f:
-        for fp in FP_id_list:
-            f.write(str(test_list[int(fp)]) + '\n')
-    with open('model_block' + '/labels/list/lstm_FN_' + sys.argv[1] + '.txt', 'wt') as f:
-        for fn in FN_id_list:
-            f.write(str(test_list[int(fn)]) + '\n')
-
-
-# -----------------------------
-# Pipeline (igual lógica)
-# -----------------------------
-def train():
-    os.environ['PYTHONHASHSEED'] = str(seed_value)
-    np.random.seed(seed_value)
-    rn.seed(seed_value)
-
-    log.info("=== PIPELINE: inicio ===")
-    with PhaseTimer("Carga y split"):
-        combined, y, x_train, x_val, x_test, y_train, y_val, y_test = loadfile()
-
-    with PhaseTimer("Tokenización"):
-        combined = tokenizer(combined)
-        x_train = tokenizer(x_train)
-        x_test = tokenizer(x_test)
-        x_val = tokenizer(x_val)
-
-    with PhaseTimer("Word2Vec + diccionarios"):
-        index_dict, word_vectors, combined = word2vec_train(combined)
-        x_train = input_transform(x_train)
-        x_test = input_transform(x_test)
-        x_val = input_transform(x_val)
-
-    with PhaseTimer("Preparar embedding"):
-        n_symbols, embedding_weights = get_data(index_dict, word_vectors, combined)
-
-    with PhaseTimer("Entrenamiento LSTM"):
-        result = train_lstm(n_symbols, embedding_weights, x_train, y_train, x_val, y_val, x_test, y_test)
-
-    log.info("=== PIPELINE: fin ===")
-    return result
-
-
-def pipeline_train(iterations):
-    seed_and_result = {}
-    if iterations == 1:
-        return train()
+    if hasattr(word_vectors, "vector_size"):
+        dim = word_vectors.vector_size
     else:
-        for i in range(0, iterations):
-            log.info(f"Iteración: {i}")
-            global seed_value
-            result = train()
-            seed_and_result[seed_value] = result
-            seed_value = seed_value + seed_window
-            i = i + 1
-        return seed_and_result
+        # gensim 3.x
+        dim = word_vectors.syn0.shape[1]
+    emb = np.zeros((n_symbols, dim), dtype=np.float32)
+    for w, i in index_dict.items():
+        if w in word_vectors:
+            emb[i, :] = word_vectors[w]
+    log.info(f"Matriz embeddings: shape={emb.shape}")
+    return n_symbols, emb
 
+# ---------------------------------------------------------------------
+# Backbone (Embedding -> BiLSTM -> Dropout)
+# ---------------------------------------------------------------------
+def build_backbone(vocab_size: int, embedding_weights: Optional[np.ndarray], max_len: int):
+    emb_dim = HP.embedding_dim if embedding_weights is None else embedding_weights.shape[1]
+    inp = Input(shape=(max_len,), name="tokens")
+    if embedding_weights is None:
+        emb = Embedding(vocab_size, emb_dim,
+                        name="emb",
+                        trainable=True,
+                        input_length=max_len,
+                        mask_zero=True)(inp)
+    else:
+        emb = Embedding(input_dim=vocab_size,
+                        output_dim=emb_dim,
+                        weights=[embedding_weights],
+                        trainable=HP.trainable_embeddings,
+                        name="emb",
+                        input_length=max_len,
+                        mask_zero=True)(inp)
+    x = Bidirectional(LSTM(HP.rnn_units,
+                           activation='sigmoid',
+                           return_sequences=False),
+                      name="bilstm")(emb)
+    x = Dropout(HP.dropout, name="dropout")(x)
+    return inp, x
 
-def eval_metric(model, history, metric_name):
-    metric = history.history[metric_name]
-    val_metric = history.history['val_' + metric_name]
-    e = range(1, n_epoch + 1)
-    plt.plot(e, metric, 'bo', label='Train ' + metric_name)
-    plt.plot(e, val_metric, 'b', label='Validation ' + metric_name)
-    plt.xlabel('Epoch number')
-    plt.ylabel(metric_name)
-    plt.title('Comparing training and validation ' + metric_name + ' for ' + model.name)
-    plt.legend()
-    plt.show()
+# ---------------------------------------------------------------------
+# Entrenamiento de UNA corrida
+# ---------------------------------------------------------------------
+def train_one(model_kind: str, dataset: Optional[str] = None, seed: int = 1001):
+    set_seeds(seed)
 
+    # 1) Carga + split
+    combined, y_all, X_tr, X_va, X_te, y_tr_idx, y_va_idx, y_te_idx = loadfile(dataset)
+    log.info(f"Datos: train={len(X_tr)} val={len(X_va)} test={len(X_te)}")
 
-def optimal_epoch(model_hist):
-    min_epoch = np.argmin(model_hist.history['val_loss']) + 1
-    log.info("Minimum validation loss reached in epoch {}".format(min_epoch))
-    return min_epoch
+    # 2) Tokenización (identidad) + Word2Vec + diccionarios
+    with PhaseTimer("Tokenización"):
+        combined_tok = tokenizer(combined)
+        Xtr_tok = tokenizer(X_tr)
+        Xva_tok = tokenizer(X_va)
+        Xte_tok = tokenizer(X_te)
 
+    with PhaseTimer("Word2Vec + diccionario"):
+        index_dict, wv, combined_tok = word2vec_train(combined_tok)
+        pad_len = HP.max_len or max((len(s) for s in Xtr_tok), default=1)
+        Xtr_idx = input_transform(Xtr_tok, index_dict, pad_to=pad_len)
+        Xva_idx = input_transform(Xva_tok, index_dict, pad_to=pad_len)
+        Xte_idx = input_transform(Xte_tok, index_dict, pad_to=pad_len)
 
-# -----------------------------
-# Main
-# -----------------------------
-if __name__ == '__main__':
-    log.info(f"Script: {os.path.abspath(__file__)}")
-    log.info(f"Dataset arg: {sys.argv[1] if len(sys.argv)>1 else '(faltante)'}")
-    result_dict = pipeline_train(n_iterations)
-    log.info(f"Dataset: {sys.argv[1]}")
+    with PhaseTimer("Embedding matrix"):
+        n_symbols, embedding_weights = get_data(index_dict, wv, combined_tok)
+
+    # 3) Etiquetas al formato correcto
+    y_tr = ensure_label_format(y_tr_idx, model_kind)
+    y_va = ensure_label_format(y_va_idx, model_kind)
+    y_te = ensure_label_format(y_te_idx, model_kind)
+
+    # 4) Modelo (KERAS standalone)
+    with PhaseTimer("Construir modelo"):
+        inp, x = build_backbone(n_symbols, embedding_weights, pad_len)
+        if model_kind == "ordinal":
+            out, loss_name, kind = add_head_ordinal(x)
+        else:
+            out, loss_name, kind = add_head_onehot(x)
+        model = Model(inp, out, name=f"BiLSTM_{kind}")
+        opt = Adam(lr=HP.learning_rate)  # Keras 2.3.1 usa 'lr'
+        model.compile(optimizer=opt, loss=loss_name, metrics=["accuracy"])
+        model.summary(print_fn=lambda s: log.info(s))
+
+    # 5) Entrenamiento
+    with PhaseTimer(f"Entrenamiento ({kind})"):
+        t0 = time.perf_counter()
+        hist = model.fit(
+            Xtr_idx, y_tr,
+            validation_data=(Xva_idx, y_va),
+            epochs=HP.epochs,
+            batch_size=HP.batch_size,
+            verbose=2,
+        )
+        train_time = time.perf_counter() - t0
+    log.info(f"Tiempo entrenamiento: {train_time:.1f}s | última val_acc={hist.history['val_accuracy'][-1]:.4f}")
+
+    # 6) Evaluación
+    with PhaseTimer("Evaluación test"):
+        test_loss, test_acc = model.evaluate(Xte_idx, y_te, verbose=0)
+    log.info(f"TEST -> loss={test_loss:.4f} | acc={test_acc:.4f}")
+
+    return {"loss": float(test_loss), "accuracy": float(test_acc), "time_s": float(train_time)}
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("dataset", nargs="?", default="cassandra",
+                        help="Nombre del dataset (p.ej., cassandra). Busca logged_syn_<dataset>.csv")
+    parser.add_argument("--model", choices=["ordinal", "onehot"], default="ordinal",
+                        help="Cabeza de salida: 'ordinal' (sigmoid+BCE) o 'onehot' (softmax+CCE)")
+    parser.add_argument("--seed", type=int, default=1001)
+    args = parser.parse_args()
+
+    log.info(f"=== INICIO: model={args.model} | seed={args.seed} | dataset={args.dataset} ===")
+    try:
+        result = train_one(args.model, dataset=args.dataset, seed=args.seed)
+        log.info(f"=== FIN {args.model.upper()} | Resultados: {result} ===")
+    except Exception as e:
+        log.exception(f"Fallo de ejecución: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
