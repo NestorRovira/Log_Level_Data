@@ -1,0 +1,19 @@
+{
+  "results_csv": "results\\experiment_cassandra\\results.csv",
+  "test_sets": [
+    "karaf",
+    "test_internal",
+    "wicket"
+  ],
+  "metrics": [
+    "accuracy",
+    "auc",
+    "aod"
+  ],
+  "outputs": {
+    "raw_results": "results\\experiment_cassandra\\analysis\\tables\\raw_results.csv",
+    "descriptive": "results\\experiment_cassandra\\analysis\\tables\\descriptive_stats.csv",
+    "inferential": "results\\experiment_cassandra\\analysis\\tables\\inferential_tests.csv",
+    "figures_dir": "results\\experiment_cassandra\\analysis\\figures"
+  }
+}
