@@ -1,0 +1,241 @@
+{
+  "created_utc": "2026-01-21T14:33:26Z",
+  "train": "cassandra",
+  "tests": [
+    "karaf",
+    "wicket"
+  ],
+  "runs": 31,
+  "plan": [
+    {
+      "pair_seed": 307833736,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 548242837,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 1537368600,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 1369745818,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 444464030,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 1684771879,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 123112493,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 307833736,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 548242837,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 1537368600,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 1369745818,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 444464030,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 1684771879,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 123112493,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 1303377710,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 847329710,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 233967667,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 411383475,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 1757885371,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 446844309,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 1860853478,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 1584978165,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 1323343727,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 864587292,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 1136315325,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 942486977,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 955873151,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    },
+    {
+      "pair_seed": 531753571,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 275058236,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 1153711095,
+      "order": [
+        "ordinal",
+        "onehot"
+      ]
+    },
+    {
+      "pair_seed": 221252786,
+      "order": [
+        "onehot",
+        "ordinal"
+      ]
+    }
+  ],
+  "hparams": {
+    "max_len": 100,
+    "embed_dim": 100,
+    "w2v_window": 5,
+    "w2v_min_count": 1,
+    "w2v_workers": 4,
+    "w2v_sg": 1,
+    "lstm_units": 128,
+    "dropout": 0.2,
+    "lr": 0.001,
+    "batch_size": 24,
+    "epochs": 100
+  }
+}
