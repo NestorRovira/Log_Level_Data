@@ -73,7 +73,7 @@ Script de análisis final automático:
 Implementación de métricas específicas del experimento:
 - **Accuracy**
 - **AUC multiclase**
-- **AOD (Average Ordinal Distance)**
+- **AOD (Average Ordinal Distance)** 
 
 ---
 
@@ -100,4 +100,3 @@ python -m src.analyze_results --results_csv results/experiment_cassandra/results
 | `results.jsonl` | Trazabilidad completa por ejecución       |
 | `analysis/` | Tablas y figuras resultantes del analisis |
 | `execution_plan.json` | Plan experimental reproducible            |
-
